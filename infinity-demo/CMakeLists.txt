@@ -60,7 +60,8 @@ target_link_libraries(doppler_infinity_imgui PUBLIC glfw OpenGL::GL)
 # ---- The doppler-infinity executable -------------------------------------
 add_executable(doppler-infinity
     src/main.cpp
-    src/infinity_client.cpp)
+    src/infinity_client.cpp
+    src/udp_rtp_bridge.cpp)
 
 target_link_libraries(doppler-infinity PRIVATE
     doppler_infinity_imgui

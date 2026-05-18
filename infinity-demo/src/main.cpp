@@ -46,6 +46,7 @@
 #include <pexpulse/pulse.h>
 
 #include "infinity_client.h"
+#include "udp_rtp_bridge.h"
 
 // ----------------------------------------------------------------------------
 //  Application state - same general shape as the SIP demo.
@@ -61,12 +62,17 @@ struct AppState
 {
     Pulse *                  pulse    = nullptr;
     doppler::InfinityClient * infinity = nullptr;
+    UdpRtpBridge *            bridge   = nullptr;   // owned by main(), borrowed here.
 
     // Connection inputs - mirror the built-in REST demo.
     char server[128]       = "";        // e.g. "vc.example.com"
     char conference[128]   = "";        // e.g. "meet.alice"
     char display_name[128] = "Doppler Infinity demo";
     char pin[32]           = "";        // optional
+
+    // Local UDP port the bridge binds to (0 == OS picks). We expose it so a
+    // user can pre-pick a port that's poked through their firewall.
+    int  local_udp_port = 40000;
 
     std::atomic<int>  connection_status{PULSE_CONNECTION_STATUS_DISCONNECTED};
     std::atomic<int>  last_async_error{PULSE_SUCCESS};
@@ -150,6 +156,89 @@ static void on_pulse_update_sdp(void * user_context, const char * update_sdp)
 }
 
 // ----------------------------------------------------------------------------
+//  Pulse <-> UdpRtpBridge wiring
+// ----------------------------------------------------------------------------
+//
+//  This is the whole point of the demo: Pulse is given an app-transport
+//  callback so it never opens a media socket itself; that callback hands the
+//  bytes to the UdpRtpBridge which puts them on the wire over a plain UDP
+//  socket. Symmetrically the bridge's receive callback bounces every inbound
+//  datagram back into Pulse via pulse_app_transport_push().
+//
+//  Combined with libcurl already owning the signalling channel, the result is
+//  a Pulse client that has no kernel sockets of its own at all - exactly what
+//  the README's "Pulse as a pure media engine" framing claims.
+
+// Outbound packet: media layer -> UDP. Runs on a Pulse worker thread; must
+// not call back into Pulse. Bridge::send is non-blocking + thread-safe, so
+// it's safe to fire from here.
+static void on_pulse_outbound_packet(void * user_context,
+                                     const uint8_t * data, int size)
+{
+    auto * app = static_cast<AppState *>(user_context);
+    if (!app || !app->bridge || size <= 0 || !data) return;
+    app->bridge->send(data, static_cast<std::size_t>(size));
+}
+
+// Tiny SDP parser: pulls the first session-level `c=IN IP4 <addr>` line and
+// the first media-section `m=audio|video|application <port> ...` line out of
+// the answer SDP, so we know where to send our UDP packets. Returns true on
+// success. Intentionally permissive (just regex-shaped scanning of text) -
+// the answer SDPs Infinity produces are well-formed.
+static bool extract_remote_from_sdp(const std::string & sdp,
+                                    std::string & out_addr,
+                                    uint16_t &   out_port)
+{
+    out_addr.clear();
+    out_port = 0;
+
+    std::size_t pos = 0;
+    while (pos < sdp.size()) {
+        std::size_t eol = sdp.find('\n', pos);
+        std::string line = sdp.substr(pos, (eol == std::string::npos ? sdp.size() : eol) - pos);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+
+        // First `c=IN IP4 <addr>` (or IP6) wins. There may be one at the
+        // session level and one per media section; the session-level one
+        // (which we hit first) is the one that applies to media sections
+        // that don't override it - good enough for our needs.
+        if (out_addr.empty()
+                && line.size() >= 9
+                && line.compare(0, 2, "c=") == 0) {
+            // Format: "c=IN IP4 1.2.3.4" or "c=IN IP6 ::1"
+            // We split on whitespace and take the third field.
+            std::size_t sp1 = line.find(' ', 2);
+            std::size_t sp2 = (sp1 == std::string::npos) ? std::string::npos
+                                                          : line.find(' ', sp1 + 1);
+            if (sp2 != std::string::npos)
+                out_addr = line.substr(sp2 + 1);
+        }
+
+        // First media-line port we encounter wins. We assume BUNDLE +
+        // rtcp-mux so a single muxed UDP port carries everything, which is
+        // what Pulse's WebRTC offer asks for.
+        if (out_port == 0
+                && line.size() >= 4
+                && line.compare(0, 2, "m=") == 0) {
+            std::size_t sp1 = line.find(' ', 2);
+            std::size_t sp2 = (sp1 == std::string::npos) ? std::string::npos
+                                                          : line.find(' ', sp1 + 1);
+            if (sp1 != std::string::npos && sp2 != std::string::npos) {
+                try {
+                    int p = std::stoi(line.substr(sp1 + 1, sp2 - sp1 - 1));
+                    if (p > 0 && p < 65536) out_port = static_cast<uint16_t>(p);
+                } catch (...) { /* leave port at 0 */ }
+            }
+        }
+
+        if (!out_addr.empty() && out_port != 0) return true;
+        if (eol == std::string::npos) break;
+        pos = eol + 1;
+    }
+    return false;
+}
+
+// ----------------------------------------------------------------------------
 //  Pulse setup (same device bindings as the other demos).
 // ----------------------------------------------------------------------------
 
@@ -158,6 +247,16 @@ static void install_callbacks(AppState & app)
     PulseConferenceStatusCallbackConfig conf_cb{ on_conference_status, &app };
     pulse_options_set_conference_state_callback(app.pulse, &conf_cb);
     pulse_options_set_application_user_agent_string(app.pulse, "doppler-infinity/0.1");
+
+    // Opt into application-driven transport BEFORE the first setup_stage_*
+    // call (the docs forbid it after connect). With this set, Pulse never
+    // opens a media socket: it hands every outbound RTP/RTCP packet to
+    // on_pulse_outbound_packet(), and expects inbound packets to be fed
+    // back in via pulse_app_transport_push().
+    pulse_options_set_app_transport(app.pulse,
+                                    on_pulse_outbound_packet,
+                                    &app,
+                                    /*destroy_cb=*/nullptr);
 }
 
 static void connect_default_devices(AppState & app)
@@ -184,6 +283,9 @@ static void connect_default_devices(AppState & app)
 static void uninstall_callbacks(AppState & app)
 {
     pulse_options_set_conference_state_callback(app.pulse, nullptr);
+    // Clear the app-transport binding too, so Pulse drops its reference to
+    // our `&app` before we tear AppState down.
+    pulse_options_set_app_transport(app.pulse, nullptr, nullptr, nullptr);
 }
 
 // ----------------------------------------------------------------------------
@@ -194,18 +296,62 @@ static void uninstall_callbacks(AppState & app)
 // the /calls answer.
 static void on_infinity_answer(AppState & app, const doppler::InfinityAnswer & ans)
 {
+    // ---- 1. Open the UDP bridge to wherever Infinity put its media -----
+    // Parse the answer SDP for `c=IN IP4 <addr>` and the first media
+    // `m=<kind> <port>` line, then open the bridge between our local port
+    // and that remote endpoint. We do this BEFORE stage_2 so that the
+    // moment Pulse starts emitting outbound packets there's already a
+    // socket waiting at the other end of our app-transport callback.
+    std::string remote_addr;
+    uint16_t    remote_port = 0;
+    if (!extract_remote_from_sdp(ans.remote_sdp, remote_addr, remote_port)) {
+        set_status(app,
+            "Answer SDP did not carry both a c=IN IP4/IP6 line and a media "
+            "port - cannot open UDP bridge.");
+        return;
+    }
+
+    if (!app.bridge->open(static_cast<uint16_t>(app.local_udp_port),
+                          remote_addr, remote_port)) {
+        set_status(app, std::string("UdpRtpBridge open failed: ")
+                            + app.bridge->last_error());
+        return;
+    }
+
+    // Bridge -> Pulse: every datagram from Infinity is pushed into Pulse's
+    // receive pipeline. This runs on the bridge's RX thread and Pulse's
+    // docs explicitly allow pulse_app_transport_push() from any thread.
+    Pulse * pulse_handle = app.pulse;
+    app.bridge->set_receive_callback(
+        [pulse_handle](const uint8_t * data, std::size_t size) {
+            pulse_app_transport_push(pulse_handle, data, size);
+        });
+
+    {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+            "UDP bridge open: local=:%u <-> remote=%s:%u",
+            static_cast<unsigned>(app.bridge->local_port()),
+            remote_addr.c_str(), static_cast<unsigned>(remote_port));
+        set_status(app, buf);
+    }
+
+    // ---- 2. Hand the answer to Pulse -----------------------------------
     PulseSetupStage2Config cfg{};
     cfg.call_uuid  = ans.call_uuid.c_str();
     cfg.remote_sdp = ans.remote_sdp.c_str();
 
     PulseError err = pulse_setup_stage_2_from_structure(app.pulse, &cfg);
     if (err != PULSE_SUCCESS) {
+        // Roll the bridge back so a retry starts clean.
+        app.bridge->close();
         set_status(app, std::string("pulse_setup_stage_2_from_structure failed: ")
                             + pulse_strerror(err));
         return;
     }
     app.stage.store(static_cast<int>(CallStage::Stage2Done));
-    set_status(app, "Infinity /calls answer received - Pulse media engaged.");
+    set_status(app,
+        "Infinity /calls answer received - Pulse media engaged via UDP bridge.");
 }
 
 static void on_infinity_failure(AppState & app, const std::string & reason)
@@ -217,6 +363,7 @@ static void on_infinity_failure(AppState & app, const std::string & reason)
         PulseAsyncOperationResultCallbackConfig result_cb{ on_async_result, &app };
         pulse_disconnect_async(app.pulse, &result_cb, nullptr);
     }
+    if (app.bridge && app.bridge->is_open()) app.bridge->close();
     app.stage.store(static_cast<int>(CallStage::Idle));
 }
 
@@ -228,6 +375,7 @@ static void on_infinity_ended(AppState & app, const std::string & reason)
         PulseAsyncOperationResultCallbackConfig result_cb{ on_async_result, &app };
         pulse_disconnect_async(app.pulse, &result_cb, nullptr);
     }
+    if (app.bridge && app.bridge->is_open()) app.bridge->close();
     app.stage.store(static_cast<int>(CallStage::Idle));
 }
 
@@ -285,6 +433,7 @@ static void start_call(AppState & app)
                         "(check that the client started OK).");
         if (pulse_is_connected(app.pulse))
             pulse_disconnect(app.pulse, nullptr);
+        if (app.bridge && app.bridge->is_open()) app.bridge->close();
         app.stage.store(static_cast<int>(CallStage::Idle));
     }
 }
@@ -301,6 +450,11 @@ static void start_hangup(AppState & app)
         pulse_disconnect(app.pulse, nullptr);
         app.stage.store(static_cast<int>(CallStage::Idle));
     }
+    // Pull the bridge down on any non-idle stage. on_infinity_ended will
+    // also do it once release_token completes, but tearing it down here
+    // releases the local UDP port immediately so a follow-up call can
+    // reuse it without waiting for the REST round-trip.
+    if (app.bridge && app.bridge->is_open()) app.bridge->close();
 }
 
 // ----------------------------------------------------------------------------
@@ -327,7 +481,9 @@ static void draw_ui(AppState & app)
     ImGui::InputText("Display name", app.display_name, sizeof(app.display_name));
     ImGui::InputText("PIN (opt.)",   app.pin,          sizeof(app.pin),
                      ImGuiInputTextFlags_Password);
-    ImGui::TextDisabled("e.g. vc.example.com / meet.alice");
+    ImGui::InputInt ("Local UDP port", &app.local_udp_port);
+    ImGui::TextDisabled("e.g. vc.example.com / meet.alice  "
+                        "(local UDP port 0 lets the OS pick)");
 
     ImGui::Spacing();
 
@@ -368,11 +524,12 @@ static void draw_ui(AppState & app)
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::TextWrapped(
-        "Pulse owns all media. libcurl drives the Pexip Infinity Client REST "
-        "API: request_token -> participants/<uuid>/calls (with Pulse's SDP "
-        "offer) -> ack, then a background thread refreshes the token. The "
-        "/calls response's SDP answer is piped straight into "
-        "pulse_setup_stage_2_from_structure(). Hang up POSTs release_token.");
+        "Pulse owns no sockets at all in this demo. libcurl drives the Pexip "
+        "Infinity Client REST API (request_token / calls / ack / refresh / "
+        "release_token), and a UdpRtpBridge owns the media socket: Pulse's "
+        "outbound RTP/RTCP is delivered via pulse_options_set_app_transport "
+        "to the bridge, and the bridge bounces inbound datagrams back into "
+        "Pulse via pulse_app_transport_push().");
 
     ImGui::End();
 }
@@ -420,6 +577,13 @@ int main()
     pulse_global_logger_callback(on_pulse_log, nullptr);
 
     AppState app;
+
+    // ---- Boot the UDP bridge handle (opened later, once we know the
+    //      remote from the Infinity answer SDP) ---------------------------
+    // Owned by main(); AppState just borrows a pointer to it.
+    UdpRtpBridge bridge;
+    app.bridge = &bridge;
+
     PulseExternalRestCallbackConfig ext_rest_cfg{};
     ext_rest_cfg.update_sdp_callback     = on_pulse_update_sdp;
     ext_rest_cfg.update_sdp_user_context = &app;
@@ -428,7 +592,7 @@ int main()
         std::fprintf(stderr, "pulse_new_external_rest() returned NULL\n");
         return 1;
     }
-    install_callbacks(app);
+    install_callbacks(app);     // also installs pulse_options_set_app_transport
     connect_default_devices(app);
 
     // ---- Boot the Infinity REST client (libcurl) ------------------------
@@ -461,7 +625,11 @@ int main()
     infinity.stop();                // release_token if needed, then quit
     if (pulse_is_connected(app.pulse))
         pulse_disconnect(app.pulse, nullptr);
+    // uninstall_callbacks() clears the app-transport binding, so do it
+    // BEFORE closing the bridge - otherwise a late outbound packet might
+    // race the bridge destructor.
     uninstall_callbacks(app);
+    bridge.close();
     pulse_free(app.pulse);
 
     ImGui_ImplOpenGL3_Shutdown();

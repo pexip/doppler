@@ -15,11 +15,19 @@ REST API ourselves with libcurl — i.e. we're re-implementing the exact
 sequence Pulse itself does in `pulse_connect_with_rest_async()`, just
 externally so we can show how the pieces fit.
 
+And to take the "Pulse as a pure media engine" framing all the way:
+Pulse never opens a media socket either. It's wired into a small
+`UdpRtpBridge` via `pulse_options_set_app_transport()` /
+`pulse_app_transport_push()`, so every outbound RTP/RTCP packet leaves
+through a UDP socket we own (and every inbound datagram is fed back
+in). The end result is a Pulse client with **zero kernel sockets of its
+own**: signalling is libcurl's, media is the bridge's.
+
 ```
 ┌──────────────────────────────┐
 │   ImGui (GLFW + OpenGL3)     │   <-- form fields:
 │                              │       Server / Conference / Display / PIN
-│  vc.example.com / meet.alice │
+│  vc.example.com / meet.alice │       Local UDP port
 │  [Call]  [Hang up]           │
 │                              │
 │  State: In call              │
@@ -40,16 +48,26 @@ externally so we can show how the pieces fit.
                │  4. answer SDP + call_uuid ◀──────── │
                │                                      │
                │ 5. pulse_setup_stage_2_from_structure
+               │
+               │  RTP/RTCP via pulse_options_set_app_transport
                ▼
-        media flows
+        ┌──────────────┐                     ┌─────────────────┐
+        │ UdpRtpBridge │ ── sendto() ──────▶ │  Infinity media │
+        │ (UDP socket) │ ◀─ recvfrom() ───── │   (host:port    │
+        │              │                     │   from c=/m=)   │
+        └──────┬───────┘                     └─────────────────┘
+               │ pulse_app_transport_push() back into Pulse
+               ▼
+        Pulse decodes/renders, ImGui shows the video window
 ```
 
 ## What's in the box
 
 | File                              | Purpose                                                    |
 | --------------------------------- | ---------------------------------------------------------- |
-| `src/main.cpp`                    | GLFW + ImGui + Pulse glue. Mirrors `sip-demo/src/main.cpp` line-for-line where possible. |
+| `src/main.cpp`                    | GLFW + ImGui + Pulse glue. Mirrors `sip-demo/src/main.cpp` line-for-line where possible. Also wires `pulse_options_set_app_transport` and parses the answer SDP for the bridge's remote. |
 | `src/infinity_client.{h,cpp}`     | Minimal libcurl wrapper for the Infinity Client REST API. Single worker thread; built-in periodic token refresh. |
+| `src/udp_rtp_bridge.{h,cpp}`      | POSIX UDP bridge (vendored from `copilot/add-rtp-packet-integration`). One RX thread + one TX thread, dependency-free. |
 | `CMakeLists.txt`                  | Build glue. Reuses the parent project's `pexip::pulse` imported target and Dear ImGui FetchContent. Pulls `nlohmann/json` via FetchContent for parsing the small JSON envelopes. |
 
 ## Prerequisites
@@ -133,6 +151,27 @@ to disable verification.
 
 ## Notes / things to investigate
 
+* **App-transport wiring vs. SDP contents.** Pulse is in app-transport
+  mode (no kernel sockets), but the *offer* SDP that
+  `pulse_setup_stage_1_from_structure()` produces still contains
+  whatever IP:port Pulse picked internally — Infinity will use those as
+  the address it sends media to. End-to-end media therefore only flows
+  cleanly when the bridge's `Local UDP port` happens to match what
+  Pulse advertised in the offer (or you arrange for the OS to route
+  packets between them). The pieces wired up in this demo are the
+  conceptual integration the task asked for; making it work against a
+  live Infinity node may need a small SDP-rewrite pass on the offer to
+  substitute in the bridge's actual address. For the *receive*
+  direction we already do the symmetric work: we parse the answer
+  SDP's `c=IN IP4 …` + the first media `m=` port and aim the bridge at
+  that endpoint.
+* **BUNDLE + rtcp-mux assumed.** The bridge is a single muxed UDP
+  socket, so the demo assumes Infinity offers everything on one port
+  (which is what Pulse's WebRTC offer asks for via `a=group:BUNDLE` and
+  `a=rtcp-mux`).
+* **Numeric remote only.** `UdpRtpBridge` does no DNS — the `c=` line
+  in Infinity answer SDPs is a numeric IPv4/IPv6 literal, which is
+  exactly what the bridge wants.
 * `present:"main"` is hard-coded in the `/calls` body. A real client
   would also wire up a content channel and react to Pulse's
   `update_sdp_callback` by POSTing the corresponding update-call
