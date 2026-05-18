@@ -122,6 +122,18 @@ if(BUILD_PEXNINJA)
     add_subdirectory(pexninja)
 endif()
 
+# ---------------------------------------------------------------------------
+# Optional: the doppler-infinity demo. Uses Pulse as a pure media engine
+# (pulse_new_external_rest + pulse_setup_stage_1/2_from_structure) and
+# drives the Pexip Infinity Client REST API from libcurl. Disabled by
+# default so the lean `doppler` build keeps working without libcurl. Flip
+# BUILD_DOPPLER_INFINITY on to build it.
+# ---------------------------------------------------------------------------
+option(BUILD_DOPPLER_INFINITY "Build the doppler-infinity (libcurl + Infinity REST) demo" OFF)
+if(BUILD_DOPPLER_INFINITY)
+    add_subdirectory(infinity-demo)
+endif()
+
 file(GENERATE
     OUTPUT  "${CMAKE_BINARY_DIR}/run-doppler.sh"
     CONTENT "#!/bin/sh

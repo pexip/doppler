@@ -32,6 +32,8 @@ little glue you need to make a call with Pulse.  The whole demo is one
 | `debs/`                 | Pre-built Pulse `.deb` packages for Ubuntu 24.04. |
 | `opt/`, `usr/`          | The extracted contents of the Pulse `.deb`s.      |
 | `pexninja/`             | The much larger reference Pulse client (optional, see below). |
+| `sip-demo/`             | Optional sibling demo: Pulse as a pure media engine, with PJSIP doing SIP signalling. See `sip-demo/README.md`. |
+| `infinity-demo/`        | Optional sibling demo: Pulse as a pure media engine, with libcurl driving the Pexip Infinity Client REST API directly. See `infinity-demo/README.md`. |
 
 ## Build
 
