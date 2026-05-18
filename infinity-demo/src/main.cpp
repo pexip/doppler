@@ -242,6 +242,62 @@ static bool extract_remote_from_sdp(const std::string & sdp,
     return false;
 }
 
+// Rewrite the port in every `m=<kind> <port> ...` line of an SDP in place.
+// We use this on the offer Pulse hands us so that what we POST to Infinity
+// advertises the UdpRtpBridge's bound port instead of the socket Pulse
+// picked internally (and which, in app-transport mode, is dangling — no
+// kernel actually owns it on our side). Without this rewrite Infinity would
+// happily send its RTP back to the port Pulse advertised, and the bridge,
+// listening on a different port, would never see a packet.
+//
+// Returns the number of m= lines that were rewritten (0 if the SDP had no
+// media sections — treated as an error by the caller).
+static std::size_t rewrite_offer_media_ports(std::string & sdp, uint16_t new_port)
+{
+    std::string out;
+    out.reserve(sdp.size() + 32);
+
+    std::size_t pos = 0;
+    std::size_t rewrites = 0;
+    while (pos < sdp.size()) {
+        std::size_t eol = sdp.find('\n', pos);
+        std::size_t line_end = (eol == std::string::npos) ? sdp.size() : eol + 1;
+        std::string line = sdp.substr(pos, line_end - pos);
+
+        // Strip any trailing CR/LF for parsing, remember it so we can put it back.
+        std::string eol_suffix;
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
+            eol_suffix.insert(eol_suffix.begin(), line.back());
+            line.pop_back();
+        }
+
+        if (line.size() >= 4 && line.compare(0, 2, "m=") == 0) {
+            // m=<kind> <port> <proto> <fmt>...
+            std::size_t sp1 = line.find(' ', 2);
+            std::size_t sp2 = (sp1 == std::string::npos) ? std::string::npos
+                                                          : line.find(' ', sp1 + 1);
+            if (sp1 != std::string::npos && sp2 != std::string::npos) {
+                std::string rewritten;
+                rewritten.reserve(line.size() + 8);
+                rewritten.append(line, 0, sp1 + 1);
+                rewritten.append(std::to_string(static_cast<unsigned>(new_port)));
+                rewritten.append(line, sp2, std::string::npos);
+                line = std::move(rewritten);
+                ++rewrites;
+            }
+        }
+
+        out.append(line);
+        out.append(eol_suffix);
+
+        if (eol == std::string::npos) break;
+        pos = eol + 1;
+    }
+
+    sdp = std::move(out);
+    return rewrites;
+}
+
 // ----------------------------------------------------------------------------
 //  Pulse setup (same device bindings as the other demos).
 // ----------------------------------------------------------------------------
@@ -300,41 +356,37 @@ static void uninstall_callbacks(AppState & app)
 // the /calls answer.
 static void on_infinity_answer(AppState & app, const doppler::InfinityAnswer & ans)
 {
-    // ---- 1. Open the UDP bridge to wherever Infinity put its media -----
-    // Parse the answer SDP for `c=IN IP4 <addr>` and the first media
-    // `m=<kind> <port>` line, then open the bridge between our local port
-    // and that remote endpoint. We do this BEFORE stage_2 so that the
-    // moment Pulse starts emitting outbound packets there's already a
-    // socket waiting at the other end of our app-transport callback.
+    // ---- 1. Aim the (already-open) UDP bridge at Infinity --------------
+    // The bridge was opened in start_call() so we knew the local port to
+    // splice into the offer. Now that we have the answer we know where to
+    // *send* media; flip the bridge's remote over to that endpoint before
+    // stage 2 so the very first packet Pulse emits has a real destination.
     std::string remote_addr;
     uint16_t    remote_port = 0;
     if (!extract_remote_from_sdp(ans.remote_sdp, remote_addr, remote_port)) {
         set_status(app,
             "Answer SDP did not carry both a c=IN IP4/IP6 line and a media "
-            "port - cannot open UDP bridge.");
+            "port - cannot aim UDP bridge.");
+        if (app.bridge && app.bridge->is_open()) app.bridge->close();
         return;
     }
 
-    if (!app.bridge->open(static_cast<uint16_t>(app.local_udp_port),
-                          remote_addr, remote_port)) {
-        set_status(app, std::string("UdpRtpBridge open failed: ")
+    if (!app.bridge || !app.bridge->is_open()) {
+        set_status(app, "UDP bridge was closed before answer arrived - aborting.");
+        return;
+    }
+
+    if (!app.bridge->set_remote(remote_addr, remote_port)) {
+        set_status(app, std::string("UdpRtpBridge set_remote failed: ")
                             + app.bridge->last_error());
+        app.bridge->close();
         return;
     }
-
-    // Bridge -> Pulse: every datagram from Infinity is pushed into Pulse's
-    // receive pipeline. This runs on the bridge's RX thread and Pulse's
-    // docs explicitly allow pulse_app_transport_push() from any thread.
-    Pulse * pulse_handle = app.pulse;
-    app.bridge->set_receive_callback(
-        [pulse_handle](const uint8_t * data, std::size_t size) {
-            pulse_app_transport_push(pulse_handle, data, size);
-        });
 
     {
         char buf[160];
         std::snprintf(buf, sizeof(buf),
-            "UDP bridge open: local=:%u <-> remote=%s:%u",
+            "UDP bridge aimed: local=:%u <-> remote=%s:%u",
             static_cast<unsigned>(app.bridge->local_port()),
             remote_addr.c_str(), static_cast<unsigned>(remote_port));
         set_status(app, buf);
@@ -417,6 +469,60 @@ static void start_call(AppState & app)
     }
     std::string local_sdp = local_sdp_ptr;
     app.stage.store(static_cast<int>(CallStage::Stage1Done));
+
+    // ---- Open the UDP bridge BEFORE we POST the offer -----------------
+    // We need the bridge's bound port so we can splice it into the offer
+    // SDP. The remote isn't known yet (it comes back in Infinity's
+    // answer), so we open against a placeholder discard endpoint and flip
+    // the destination over in on_infinity_answer() via set_remote().
+    //
+    // Wiring the bridge -> Pulse receive callback before open() makes
+    // sure we don't drop the first inbound datagrams.
+    Pulse * pulse_handle = app.pulse;
+    app.bridge->set_receive_callback(
+        [pulse_handle](const uint8_t * data, std::size_t size) {
+            pulse_app_transport_push(pulse_handle, data, size);
+        });
+
+    // 0.0.0.0:9 is just a harmless placeholder destination (port 9 is the
+    // RFC 863 discard port, but nothing here relies on a discard service
+    // actually running there). Any sends() that race the answer will
+    // either be dropped by the network stack or ignored on arrival; the
+    // real destination is patched in by on_infinity_answer() via
+    // UdpRtpBridge::set_remote().
+    if (!app.bridge->open(static_cast<uint16_t>(app.local_udp_port),
+                          "0.0.0.0", /*remote_port=*/9)) {
+        set_status(app, std::string("UdpRtpBridge open failed: ")
+                            + app.bridge->last_error());
+        if (pulse_is_connected(app.pulse))
+            pulse_disconnect(app.pulse, nullptr);
+        app.stage.store(static_cast<int>(CallStage::Idle));
+        return;
+    }
+
+    // Rewrite every `m=<kind> <port> ...` line in the offer to point at
+    // the bridge's actual bound port. Pulse, being in app-transport mode,
+    // doesn't own a real socket on the port it printed into the offer;
+    // without this rewrite Infinity would send media to a dead address.
+    const uint16_t bridge_port = app.bridge->local_port();
+    const std::size_t rewrites = rewrite_offer_media_ports(local_sdp, bridge_port);
+    if (rewrites == 0) {
+        set_status(app,
+            "Pulse offer had no m=<kind> <port> lines to rewrite - aborting.");
+        app.bridge->close();
+        if (pulse_is_connected(app.pulse))
+            pulse_disconnect(app.pulse, nullptr);
+        app.stage.store(static_cast<int>(CallStage::Idle));
+        return;
+    }
+    {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf),
+            "Rewrote %zu offer m= line(s) to bridge port %u; "
+            "POSTing offer to Infinity...",
+            rewrites, static_cast<unsigned>(bridge_port));
+        set_status(app, buf);
+    }
 
     // ---- POST through the Infinity Client REST API --------------------
     set_status(app, std::string("Calling ") + app.conference + " on "

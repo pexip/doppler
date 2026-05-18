@@ -65,7 +65,7 @@ own**: signalling is libcurl's, media is the bridge's.
 
 | File                              | Purpose                                                    |
 | --------------------------------- | ---------------------------------------------------------- |
-| `src/main.cpp`                    | GLFW + ImGui + Pulse glue. Mirrors `sip-demo/src/main.cpp` line-for-line where possible. Also wires `pulse_options_set_app_transport` and parses the answer SDP for the bridge's remote. |
+| `src/main.cpp`                    | GLFW + ImGui + Pulse glue. Mirrors `sip-demo/src/main.cpp` line-for-line where possible. Also wires `pulse_options_set_app_transport`, rewrites the offer's `m=` port to the bridge's bound port, and parses the answer SDP for the bridge's remote. |
 | `src/infinity_client.{h,cpp}`     | Minimal libcurl wrapper for the Infinity Client REST API. Single worker thread; built-in periodic token refresh. |
 | `src/udp_rtp_bridge.{h,cpp}`      | POSIX UDP bridge (vendored from `copilot/add-rtp-packet-integration`). One RX thread + one TX thread, dependency-free. |
 | `CMakeLists.txt`                  | Build glue. Reuses the parent project's `pexip::pulse` imported target and Dear ImGui FetchContent. Pulls `nlohmann/json` via FetchContent for parsing the small JSON envelopes. |
@@ -152,19 +152,18 @@ to disable verification.
 ## Notes / things to investigate
 
 * **App-transport wiring vs. SDP contents.** Pulse is in app-transport
-  mode (no kernel sockets), but the *offer* SDP that
-  `pulse_setup_stage_1_from_structure()` produces still contains
-  whatever IP:port Pulse picked internally — Infinity will use those as
-  the address it sends media to. End-to-end media therefore only flows
-  cleanly when the bridge's `Local UDP port` happens to match what
-  Pulse advertised in the offer (or you arrange for the OS to route
-  packets between them). The pieces wired up in this demo are the
-  conceptual integration the task asked for; making it work against a
-  live Infinity node may need a small SDP-rewrite pass on the offer to
-  substitute in the bridge's actual address. For the *receive*
-  direction we already do the symmetric work: we parse the answer
-  SDP's `c=IN IP4 …` + the first media `m=` port and aim the bridge at
-  that endpoint.
+  mode (no kernel sockets), so the *offer* SDP that
+  `pulse_setup_stage_1_from_structure()` produces contains a media port
+  that nothing on our side actually owns. The demo therefore opens the
+  `UdpRtpBridge` first, then rewrites every `m=<kind> <port> ...` line
+  in the offer to the bridge's bound port before POSTing the offer to
+  Infinity. That way Infinity sends RTP/RTCP back to the port the
+  bridge is listening on. Symmetrically, for the *receive* direction we
+  parse the answer SDP's `c=IN IP4 …` + first media `m=` port and aim
+  the bridge at that endpoint via `UdpRtpBridge::set_remote()`. The
+  `c=` address in the offer is left untouched — Pulse's value is fine
+  on a single-host loopback test, and a real deployment will usually
+  want to substitute in a routable interface address there too.
 * **BUNDLE + rtcp-mux assumed.** The bridge is a single muxed UDP
   socket, so the demo assumes Infinity offers everything on one port
   (which is what Pulse's WebRTC offer asks for via `a=group:BUNDLE` and
