@@ -49,10 +49,11 @@ namespace {
 // callers are expected to inspect out_status / the JSON body's "status"
 // field themselves.
 //
-// We allow the caller to disable TLS verification (insecure!) because
-// Pexip Infinity nodes are very often deployed with self-signed certs and
-// turning verification off is the right call for an unattended demo.
-// Production code obviously shouldn't do this.
+// We allow the caller to disable TLS verification (insecure!) for the
+// common case where the Infinity node is deployed with a self-signed or
+// internal-CA certificate. This is OFF by default and requires an
+// explicit opt-in via the DOPPLER_INFINITY_INSECURE_TLS env var.
+// Production code should never disable verification.
 
 static size_t write_cb(char * ptr, size_t size, size_t nmemb, void * userdata)
 {
@@ -169,7 +170,7 @@ struct InfinityClient::Impl
 {
     // ---- Lifetime / config (set by start(), const after) ------------------
     std::string user_agent;
-    bool        insecure_tls = true;
+    bool        insecure_tls = false;
 
     // ---- libcurl easy handle owned exclusively by the worker thread -------
     CURL *      curl = nullptr;
@@ -260,11 +261,13 @@ std::string InfinityClient::start(const std::string & user_agent)
     }
 
     impl_->user_agent = user_agent.empty() ? "doppler-infinity/0.1" : user_agent;
-    // Allow the user to override the demo-friendly default of "skip TLS
-    // verification" via the environment, for the unusual case where the
-    // Infinity node has a publicly-trusted certificate.
-    if (const char * v = std::getenv("DOPPLER_INFINITY_VERIFY_TLS"))
-        impl_->insecure_tls = !(v[0] == '1' || v[0] == 't' || v[0] == 'T');
+    // TLS verification is ON by default - secure-by-default. Pexip Infinity
+    // nodes are very commonly deployed with self-signed or internal-CA
+    // certificates; for that case the user can explicitly opt out via the
+    // environment. Production code obviously should never opt out.
+    impl_->insecure_tls = false;
+    if (const char * v = std::getenv("DOPPLER_INFINITY_INSECURE_TLS"))
+        impl_->insecure_tls = (v[0] == '1' || v[0] == 't' || v[0] == 'T');
 
     impl_->running = true;
     impl_->worker  = std::thread([this] { impl_->run(); });

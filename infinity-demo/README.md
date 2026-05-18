@@ -108,17 +108,28 @@ Press **Call**. Behind the scenes:
 
 ## TLS
 
-By default the demo **skips TLS certificate verification** (`CURLOPT_SSL_VERIFY{PEER,HOST} = 0`)
-because Pexip Infinity nodes are very commonly deployed with self-signed
-or internal-CA certificates. To enable verification (for a node with a
-publicly-trusted cert) set:
+TLS certificate verification is **enabled by default**
+(`CURLOPT_SSL_VERIFY{PEER,HOST}` = 1) — secure by default. If you point
+the demo at a Pexip Infinity node that uses a self-signed or
+internal-CA certificate (very common in test/lab deployments) the call
+will fail at `request_token` with a TLS error.
+
+> ⚠️ **WARNING — debug/lab only.** The opt-out below disables TLS
+> certificate verification entirely, which exposes the demo to
+> man-in-the-middle attacks (the conference PIN, all signalling, and any
+> tokens travel in the clear from libcurl's point of view). **Never use
+> this against a production conference, never ship code with this set,
+> and never paste real credentials into a session run this way.** Use it
+> only against a lab node whose self-signed cert you'd otherwise have
+> to install into the system trust store.
 
 ```bash
-DOPPLER_INFINITY_VERIFY_TLS=1 ./build/run-doppler-infinity.sh
+DOPPLER_INFINITY_INSECURE_TLS=1 ./build/run-doppler-infinity.sh
 ```
 
-Production code obviously shouldn't ship with verification off — this is
-a demo.
+The proper fix for a real deployment is to add the Infinity node's CA
+to the system trust store (or use a publicly-trusted certificate), not
+to disable verification.
 
 ## Notes / things to investigate
 
