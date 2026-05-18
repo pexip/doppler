@@ -227,7 +227,11 @@ static bool extract_remote_from_sdp(const std::string & sdp,
                 try {
                     int p = std::stoi(line.substr(sp1 + 1, sp2 - sp1 - 1));
                     if (p > 0 && p < 65536) out_port = static_cast<uint16_t>(p);
-                } catch (...) { /* leave port at 0 */ }
+                } catch (...) {
+                    // Swallow both invalid_argument (non-numeric port) and
+                    // out_of_range (port > INT_MAX); either way we just
+                    // leave out_port at 0 and move on to the next line.
+                }
             }
         }
 

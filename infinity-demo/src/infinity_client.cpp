@@ -463,12 +463,17 @@ void InfinityClient::Impl::do_place_call(Job & job)
 
     const std::string token             = result.value("token", "");
     const std::string participant_uuid  = result.value("participant_uuid", "");
-    // expires may come as either a string ("120") or a number (120).
+    // expires may come as either a string ("120") or a number (120). If
+    // parsing the string form throws (invalid_argument / out_of_range), we
+    // intentionally fall back to the Infinity default of 120s rather than
+    // failing the whole call setup over a cosmetic field - the refresh
+    // loop will quickly find out the real expiry via the first
+    // refresh_token response either way.
     int expires_s = 120;
     if (result.contains("expires")) {
         if (result["expires"].is_string()) {
             try { expires_s = std::stoi(result["expires"].get<std::string>()); }
-            catch (...) {}
+            catch (...) { /* keep 120s fallback */ }
         } else if (result["expires"].is_number_integer()) {
             expires_s = result["expires"].get<int>();
         }
@@ -567,11 +572,14 @@ void InfinityClient::Impl::do_refresh()
     }
     const std::string new_token = result.value("token", "");
     if (!new_token.empty()) cur_token = new_token;
+    // Same string/number duality (and same 120s fallback rationale) as in
+    // do_place_call - see comment there. A bad-parse here just means we'll
+    // wake up to refresh again 60s from now, which is harmless.
     int expires_s = 120;
     if (result.contains("expires")) {
         if (result["expires"].is_string()) {
             try { expires_s = std::stoi(result["expires"].get<std::string>()); }
-            catch (...) {}
+            catch (...) { /* keep 120s fallback */ }
         } else if (result["expires"].is_number_integer()) {
             expires_s = result["expires"].get<int>();
         }
