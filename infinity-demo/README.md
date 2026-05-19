@@ -151,6 +151,20 @@ to disable verification.
 
 ## Notes / things to investigate
 
+* **Diagnostics.** `infinity_client` logs every Infinity HTTPS exchange
+  to stderr with an `[infinity]` prefix — the request URL and body size,
+  the response status, and (on non-2xx) a preview of the response body
+  with the failure reason extracted from Infinity's `{"status":"failed",
+  "result":"..."}` envelope. The same reason is also folded into the
+  `on_failure` message the UI status line shows. Specific status codes
+  Pexip Infinity is known to use are annotated inline: in particular
+  **HTTP 520** on `/calls` is *not* a standard HTTP status — it is
+  Infinity's "media negotiation failed" indicator (see
+  [docs.pexip.com → Client REST API](https://docs.pexip.com/api_client/api_rest.htm)),
+  typically meaning the offer SDP couldn't be turned into a real call
+  (no compatible codecs, BUNDLE/rtcp-mux issues, bad `m=` port, …). On
+  520 we also dump the full offer SDP to stderr so you can see exactly
+  what Infinity refused.
 * **App-transport wiring vs. SDP contents.** Pulse is in app-transport
   mode (no kernel sockets), so the *offer* SDP that
   `pulse_setup_stage_1_from_structure()` produces contains a media port

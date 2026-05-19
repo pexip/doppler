@@ -22,12 +22,14 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <queue>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
@@ -38,6 +40,48 @@ using json = nlohmann::json;
 using clock_t_ = std::chrono::steady_clock;
 
 namespace {
+
+// ---- Logging ---------------------------------------------------------------
+//
+// All logs go to stderr with an `[infinity]` prefix so they're easy to
+// pick out of a mixed-source log file. There's no level filter beyond
+// "always on" right now — every libcurl exchange this client does is
+// worth logging at this stage of the demo, and a few lines per call
+// don't hurt anyone. If that ever stops being true, gate it on an env
+// var here.
+
+static void infinity_log(const char * fmt, ...)
+    __attribute__((format(printf, 1, 2)));
+
+static void infinity_log(const char * fmt, ...)
+{
+    std::fprintf(stderr, "[infinity] ");
+    va_list ap;
+    va_start(ap, fmt);
+    std::vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    std::fputc('\n', stderr);
+}
+
+// Pexip Infinity's Client REST API uses HTTP status 520 as a *non-standard*
+// "media negotiation failed" indicator on the /calls endpoint (see
+// https://docs.pexip.com/api_client/api_rest.htm — 520 is documented there
+// alongside 200/403/404/502 as a possible response). The actual reason is
+// in the JSON body's `result` field; we surface that, but for the common
+// case where the body is empty/opaque we annotate the status code itself
+// so the UI gives the user *something* actionable.
+static const char * infinity_status_annotation(long status)
+{
+    switch (status) {
+        case 403: return "PIN required or wrong / token rejected";
+        case 404: return "conference alias not found";
+        case 502: return "call setup failed (gateway error)";
+        case 520: return "media negotiation failed - Infinity could not "
+                         "negotiate the offered SDP (check codecs, "
+                         "BUNDLE/rtcp-mux, and the rewritten m= port)";
+        default:  return nullptr;
+    }
+}
 
 // ---- libcurl helpers -------------------------------------------------------
 //
@@ -62,15 +106,57 @@ static size_t write_cb(char * ptr, size_t size, size_t nmemb, void * userdata)
     return size * nmemb;
 }
 
+// Best-effort one-line description of a response body for logging.
+// Trims to a sensible length and replaces control chars so it stays on
+// one log line. Non-JSON bodies are passed through verbatim (truncated).
+static std::string preview_body(const std::string & body, std::size_t max_len = 512)
+{
+    if (body.empty()) return "<empty>";
+    std::string out;
+    out.reserve(std::min(body.size(), max_len));
+    for (std::size_t i = 0; i < body.size() && out.size() < max_len; ++i) {
+        unsigned char c = static_cast<unsigned char>(body[i]);
+        if (c == '\n' || c == '\r' || c == '\t') out.push_back(' ');
+        else if (c < 0x20 || c == 0x7f)          out.push_back('?');
+        else                                      out.push_back(static_cast<char>(c));
+    }
+    if (body.size() > max_len) out.append("...[+")
+                                   .append(std::to_string(body.size() - max_len))
+                                   .append(" bytes]");
+    return out;
+}
+
+// Best-effort extraction of Infinity's JSON `result` reason (string form)
+// from a response body. Returns "" if the body isn't an Infinity-shaped
+// JSON envelope or doesn't carry a string reason — caller can then fall
+// back to `preview_body()` for raw text.
+static std::string extract_failure_reason(const std::string & body)
+{
+    try {
+        json doc = json::parse(body);
+        if (doc.contains("result") && doc["result"].is_string())
+            return doc["result"].get<std::string>();
+    } catch (...) { /* fall through */ }
+    return {};
+}
+
 static std::string http_post(CURL * curl, const std::string & url,
                              const std::string & body,
                              const std::string & token,
                              const std::string & user_agent,
                              bool insecure_tls,
-                             std::string * out_body, long * out_status)
+                             std::string * out_body, long * out_status,
+                             const std::vector<std::string> & extra_headers = {})
 {
     out_body->clear();
     *out_status = 0;
+
+    infinity_log("-> POST %s (body=%zu bytes, token=%s%s)",
+                 url.c_str(), body.size(),
+                 token.empty() ? "no" : "yes",
+                 extra_headers.empty() ? ""
+                                       : (", +" + std::to_string(extra_headers.size())
+                                              + " hdr").c_str());
 
     curl_easy_reset(curl);
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
@@ -97,6 +183,8 @@ static std::string http_post(CURL * curl, const std::string & url,
         tok_header = "token: " + token;
         headers = curl_slist_append(headers, tok_header.c_str());
     }
+    for (const std::string & h : extra_headers)
+        headers = curl_slist_append(headers, h.c_str());
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
     CURLcode rc = curl_easy_perform(curl);
@@ -105,8 +193,25 @@ static std::string http_post(CURL * curl, const std::string & url,
 
     curl_slist_free_all(headers);
 
-    if (rc != CURLE_OK)
+    if (rc != CURLE_OK) {
+        infinity_log("<- TRANSPORT ERROR %s: %s",
+                     url.c_str(), curl_easy_strerror(rc));
         return std::string("HTTP transport error: ") + curl_easy_strerror(rc);
+    }
+
+    // Body always logged on non-2xx (that's where the answer to "why did
+    // this fail" lives); on success we just note the size to keep noise
+    // low without losing the audit trail.
+    if (*out_status / 100 != 2) {
+        const char * note = infinity_status_annotation(*out_status);
+        infinity_log("<- HTTP %ld (%zu bytes)%s%s body=%s",
+                     *out_status, out_body->size(),
+                     note ? " - " : "", note ? note : "",
+                     preview_body(*out_body).c_str());
+    } else {
+        infinity_log("<- HTTP %ld (%zu bytes)",
+                     *out_status, out_body->size());
+    }
     return {};
 }
 
@@ -401,50 +506,25 @@ void InfinityClient::Impl::do_place_call(Job & job)
     long status = 0;
     json result;
 
+    infinity_log("place_call: server=%s conference=%s display=\"%s\" pin=%s",
+                 job.server.c_str(), job.conference.c_str(),
+                 job.display_name.c_str(),
+                 job.pin.empty() ? "no" : "yes");
+
     // ---- 1. request_token -----------------------------------------------
+    // Infinity wants the PIN (if any) in a custom `pin: <value>` header,
+    // not in the JSON body. http_post() now takes optional extra headers
+    // so we can go through the same logging/TLS path as everything else.
     {
         json req = { {"display_name", job.display_name} };
-        // The Infinity REST API uses a "pin" *header*, not a body field.
-        // We can't slip a custom header through http_post() (it owns the
-        // header list), so we extend http_post a bit by inlining the few
-        // extras we need below. To keep the helper general for the other
-        // requests we patch the slist here at the call site.
-        curl_easy_reset(curl);
-        curl_easy_setopt(curl, CURLOPT_URL, (base + "/request_token").c_str());
-        curl_easy_setopt(curl, CURLOPT_POST, 1L);
-        const std::string body_str = req.dump();
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body_str.c_str());
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE,
-                         static_cast<long>(body_str.size()));
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
-        curl_easy_setopt(curl, CURLOPT_USERAGENT, user_agent.c_str());
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
-        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-        if (insecure_tls) {
-            curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-            curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
-        }
+        std::vector<std::string> extra_h;
+        if (!job.pin.empty()) extra_h.push_back("pin: " + job.pin);
 
-        struct curl_slist * h = nullptr;
-        h = curl_slist_append(h, "Content-Type: application/json");
-        h = curl_slist_append(h, "Accept: application/json");
-        std::string pin_header;
-        if (!job.pin.empty()) {
-            pin_header = "pin: " + job.pin;
-            h = curl_slist_append(h, pin_header.c_str());
-        }
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, h);
-
-        body.clear();
-        CURLcode rc = curl_easy_perform(curl);
-        if (rc == CURLE_OK)
-            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
-        curl_slist_free_all(h);
-        if (rc != CURLE_OK) {
-            job.on_failure(std::string("request_token transport error: ")
-                           + curl_easy_strerror(rc));
+        err = http_post(curl, base + "/request_token", req.dump(),
+                        /*token=*/std::string(), user_agent, insecure_tls,
+                        &body, &status, extra_h);
+        if (!err.empty()) {
+            job.on_failure("request_token: " + err);
             return;
         }
     }
@@ -455,7 +535,12 @@ void InfinityClient::Impl::do_place_call(Job & job)
         return;
     }
     if (status / 100 != 2) {
-        job.on_failure("request_token HTTP " + std::to_string(status));
+        const std::string reason = extract_failure_reason(body);
+        std::string msg = "request_token HTTP " + std::to_string(status);
+        if (const char * note = infinity_status_annotation(status))
+            msg += std::string(" - ") + note;
+        if (!reason.empty()) msg += " (" + reason + ")";
+        job.on_failure(msg);
         return;
     }
     err = unwrap_result(body, &result);
@@ -491,12 +576,33 @@ void InfinityClient::Impl::do_place_call(Job & job)
             {"sdp",       job.local_offer},
             {"present",   "main"},
         };
+        infinity_log("calls: posting offer (%zu bytes of SDP)",
+                     job.local_offer.size());
         err = http_post(curl, base + "/participants/" + participant_uuid + "/calls",
                         req.dump(), token, user_agent, insecure_tls,
                         &body, &status);
         if (!err.empty()) { job.on_failure(err); return; }
         if (status / 100 != 2) {
-            job.on_failure("calls HTTP " + std::to_string(status));
+            // Infinity uses non-standard 520 here to mean "media
+            // negotiation failed" — see infinity_status_annotation().
+            // Dump the offer SDP we sent so the user can immediately
+            // see what Infinity refused; the response body almost
+            // always carries a `result` string explaining why.
+            const std::string reason = extract_failure_reason(body);
+            if (status == 520) {
+                infinity_log("calls: rejected with HTTP 520. The offer we "
+                             "sent was (%zu bytes):\n%s",
+                             job.local_offer.size(), job.local_offer.c_str());
+            }
+            std::string msg = "calls HTTP " + std::to_string(status);
+            if (const char * note = infinity_status_annotation(status))
+                msg += std::string(" - ") + note;
+            if (!reason.empty()) {
+                msg += " (" + reason + ")";
+            } else if (!body.empty()) {
+                msg += " [body: " + preview_body(body, 200) + "]";
+            }
+            job.on_failure(msg);
             return;
         }
         err = unwrap_result(body, &result);
@@ -508,6 +614,8 @@ void InfinityClient::Impl::do_place_call(Job & job)
             job.on_failure("calls response missing call_uuid/sdp");
             return;
         }
+        infinity_log("calls: got answer SDP (%zu bytes), call_uuid=%s",
+                     remote_sdp.size(), call_uuid.c_str());
     }
 
     // ---- 3. ack ----------------------------------------------------------
@@ -542,6 +650,7 @@ void InfinityClient::Impl::do_place_call(Job & job)
     InfinityAnswer ans;
     ans.remote_sdp = remote_sdp;
     ans.call_uuid  = call_uuid;
+    infinity_log("place_call: success, refresh scheduled in %ds", refresh_in_s);
     job.on_answer(ans);
 }
 
@@ -549,6 +658,7 @@ void InfinityClient::Impl::do_refresh()
 {
     if (!in_call) return;
 
+    infinity_log("refresh_token: due (call_uuid=%s)", cur_call_uuid.c_str());
     const std::string base = conf_base(curl, cur_server, cur_conference);
     std::string body;
     long status = 0;
@@ -556,10 +666,19 @@ void InfinityClient::Impl::do_refresh()
                                 cur_token, user_agent, insecure_tls,
                                 &body, &status);
     if (!err.empty() || status / 100 != 2) {
+        const std::string reason = extract_failure_reason(body);
+        std::string msg = "refresh_token failed: ";
+        if (!err.empty()) {
+            msg += err;
+        } else {
+            msg += "HTTP " + std::to_string(status);
+            if (const char * note = infinity_status_annotation(status))
+                msg += std::string(" - ") + note;
+            if (!reason.empty()) msg += " (" + reason + ")";
+        }
         auto ended = cur_on_ended;
         clear_call_state();
-        if (ended) ended("refresh_token failed: "
-                         + (err.empty() ? "HTTP " + std::to_string(status) : err));
+        if (ended) ended(msg);
         return;
     }
     json result;
@@ -593,6 +712,8 @@ void InfinityClient::Impl::do_hangup()
 {
     if (!in_call) return;
 
+    infinity_log("hangup: posting release_token (call_uuid=%s)",
+                 cur_call_uuid.c_str());
     const std::string base = conf_base(curl, cur_server, cur_conference);
     std::string body;
     long status = 0;
