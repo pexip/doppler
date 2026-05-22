@@ -863,7 +863,12 @@ int main()
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 2);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+#ifdef __APPLE__
+    // Required on macOS to get a 3.2+ Core context. On Linux/GLX this attribute
+    // is rejected by some drivers (BadValue from glXCreateContextAttribsARB),
+    // so only enable it on Apple platforms.
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
+#endif
 
     GLFWwindow * window = glfwCreateWindow(960, 720,
                                            "Doppler - Pulse demo", nullptr, nullptr);
