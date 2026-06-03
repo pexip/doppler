@@ -259,20 +259,30 @@ static void on_pulse_log(void * /*user_context*/, PulseDebugLevel level,
 //  gateway never touches local devices.
 // ----------------------------------------------------------------------------
 
-static PulseDataSessionConfig * make_audio_config()
+// Build a combined audio+video INPUT config.
+//
+// IMPORTANT: each MAIN data-session can only have ONE input config and
+// ONE output config attached at a time.  Calling
+// pulse_data_session_connect_input() twice on the same media-content
+// slot (once for audio, once for video) does NOT register both — the
+// second call replaces the first, leaving the session with only one of
+// the two media types configured.  That was the original bug in this
+// file: an audio-only `connect_input` was immediately overwritten by a
+// video-only `connect_input`, so all audio push_frame()s after that
+// silently went nowhere while video kept flowing.
+//
+// The fix is to describe both media in a single config (one of the
+// _AUDIO_FROM_VALUES_VIDEO_FROM_VALUES style masks documented in
+// pexpulse/pulse_data_session.h) and call connect_input() exactly once.
+static PulseDataSessionConfig * make_input_config()
 {
-    PulseDataSessionConfig * cfg =
-        pulse_data_session_config_new(PULSE_DATA_SESSION_AUDIO_FROM_VALUES);
+    PulseDataSessionConfig * cfg = pulse_data_session_config_new(
+        PULSE_DATA_SESSION_AUDIO_FROM_VALUES_VIDEO_FROM_VALUES);
     pulse_data_session_config_audio_from_values(cfg,
         PULSE_MEDIA_AUDIO_FORMAT_F32LE,
         PULSE_MEDIA_AUDIO_LAYOUT_INTERLEAVED,
         kAudioRateHz, kAudioChannels);
-    return cfg;
-}
-
-static PulseDataSessionConfig * make_video_input_config()
-{
-    // The INPUT side is configured with VIDEO_FROM_VALUES so we can
+    // The video half is configured with VIDEO_FROM_VALUES so we can
     // later send an `update_config` (also VIDEO_FROM_VALUES) on each
     // pushed frame that tweaks the dimensions when the source's
     // resolution changes.  PulseDataSessionFrameData has no
@@ -282,8 +292,6 @@ static PulseDataSessionConfig * make_video_input_config()
     //
     // The placeholder dims/framerate here are overwritten by the
     // first per-frame update_config we attach.
-    PulseDataSessionConfig * cfg =
-        pulse_data_session_config_new(PULSE_DATA_SESSION_VIDEO_FROM_VALUES);
     PulseDimensions dims{640, 360};
     PulseFramerate  fps{30, 1};
     pulse_data_session_config_video_from_values(cfg,
@@ -291,14 +299,22 @@ static PulseDataSessionConfig * make_video_input_config()
     return cfg;
 }
 
-static PulseDataSessionConfig * make_video_output_config()
+// Build a combined audio+video OUTPUT config.  Same single-config-per-
+// session rule as for input, hence audio + video go in together.
+//
+// Audio is described by values (fixed F32LE 48 kHz mono) while video is
+// described by caps — the OUTPUT side just pulls already-decoded frames,
+// so caps are enough: Pulse fills in the actual dimensions on every
+// pulled PulseDataSessionFrameData and we read them back with
+// pulse_frame_data_get_resolution().
+static PulseDataSessionConfig * make_output_config()
 {
-    // The OUTPUT side just pulls already-decoded frames, so caps are
-    // enough: Pulse fills in the actual dimensions on every pulled
-    // PulseDataSessionFrameData and we read them back with
-    // pulse_frame_data_get_resolution().
-    PulseDataSessionConfig * cfg =
-        pulse_data_session_config_new(PULSE_DATA_SESSION_VIDEO_FROM_CAPS);
+    PulseDataSessionConfig * cfg = pulse_data_session_config_new(
+        PULSE_DATA_SESSION_AUDIO_FROM_VALUES_VIDEO_FROM_CAPS);
+    pulse_data_session_config_audio_from_values(cfg,
+        PULSE_MEDIA_AUDIO_FORMAT_F32LE,
+        PULSE_MEDIA_AUDIO_LAYOUT_INTERLEAVED,
+        kAudioRateHz, kAudioChannels);
     pulse_data_session_config_video_from_caps(cfg, kVideoCaps);
     return cfg;
 }
@@ -318,29 +334,50 @@ static PulseDataSessionConfig * make_video_update_config(int w, int h)
     return cfg;
 }
 
-// Open all four data sessions for a leg.  Called once per leg at boot,
-// BEFORE connecting to a conference.  The sessions stay open across
-// connect/disconnect cycles.
+// Open the input and output data sessions for a leg.  Called once per
+// leg at boot, BEFORE connecting to a conference.  The sessions stay
+// open across connect/disconnect cycles.
+//
+// We open exactly TWO sessions per leg on PULSE_MEDIA_CONTENT_MAIN:
+//
+//      - one INPUT  (carries both raw F32LE PCM and raw I420 video INTO
+//                    the call — replaces the system mic + camera)
+//      - one OUTPUT (carries both raw F32LE PCM and raw I420 video OUT
+//                    of the call — replaces the speaker + video window)
+//
+// A single PulseDataSessionFrame can carry an `audio` and a `video`
+// PulseDataSessionFrameData side by side, which is how Pulse expects
+// both media types to share a session.
 static void open_data_sessions(LegState & leg)
 {
-    PulseDataSessionConfig * a_in  = make_audio_config();
-    PulseDataSessionConfig * v_in  = make_video_input_config();
-    PulseDataSessionConfig * a_out = make_audio_config();
-    PulseDataSessionConfig * v_out = make_video_output_config();
+    PulseDataSessionConfig * in_cfg  = make_input_config();
+    PulseDataSessionConfig * out_cfg = make_output_config();
 
-    pulse_data_session_connect_input (leg.pulse, a_in,  PULSE_MEDIA_CONTENT_MAIN);
-    pulse_data_session_connect_input (leg.pulse, v_in,  PULSE_MEDIA_CONTENT_MAIN);
-    pulse_data_session_connect_output(leg.pulse, a_out, PULSE_MEDIA_CONTENT_MAIN);
-    pulse_data_session_connect_output(leg.pulse, v_out, PULSE_MEDIA_CONTENT_MAIN);
+    PulseError err;
+    err = pulse_data_session_connect_input(leg.pulse, in_cfg,
+                                           PULSE_MEDIA_CONTENT_MAIN);
+    if (err != PULSE_SUCCESS) {
+        std::fprintf(stderr,
+            "[%s] pulse_data_session_connect_input failed: %s\n",
+            leg.label, pulse_strerror(err));
+    }
+    err = pulse_data_session_connect_output(leg.pulse, out_cfg,
+                                            PULSE_MEDIA_CONTENT_MAIN);
+    if (err != PULSE_SUCCESS) {
+        std::fprintf(stderr,
+            "[%s] pulse_data_session_connect_output failed: %s\n",
+            leg.label, pulse_strerror(err));
+    }
 
-    pulse_data_session_config_free(a_in);
-    pulse_data_session_config_free(v_in);
-    pulse_data_session_config_free(a_out);
-    pulse_data_session_config_free(v_out);
+    pulse_data_session_config_free(in_cfg);
+    pulse_data_session_config_free(out_cfg);
 }
 
 static void close_data_sessions(LegState & leg)
 {
+    // Audio and video share the same INPUT/OUTPUT session on MAIN, but
+    // the disconnect API still wants per-media-type calls — it just
+    // tears down the corresponding half of the underlying session.
     pulse_data_session_disconnect(leg.pulse, PULSE_MEDIA_AUDIO,
                                   PULSE_MEDIA_INPUT,  PULSE_MEDIA_CONTENT_MAIN);
     pulse_data_session_disconnect(leg.pulse, PULSE_MEDIA_VIDEO,
@@ -544,6 +581,19 @@ static bool forward_one(LegState & src, LegState & dst, PulseMediaType media)
     }
     PulseError push_err = pulse_data_session_push_frame(dst.pulse, &out_frame,
                                                         PULSE_MEDIA_CONTENT_MAIN);
+    if (push_err != PULSE_SUCCESS) {
+        // Rate-limited stderr complaint: a silent failure here is what
+        // caused the original "audio in, no audio out" bug, so make
+        // sure any future regression is loud.
+        static std::atomic<uint64_t> warn_counter{0};
+        if ((warn_counter.fetch_add(1) % 100) == 0) {
+            std::fprintf(stderr,
+                "[%s -> %s] pulse_data_session_push_frame(%s) failed: %s\n",
+                src.label, dst.label,
+                media == PULSE_MEDIA_AUDIO ? "audio" : "video",
+                pulse_strerror(push_err));
+        }
+    }
     if (upd_cfg) {
         pulse_data_session_config_free(upd_cfg);
         if (push_err == PULSE_SUCCESS) {
@@ -714,7 +764,7 @@ static void draw_ui(GatewayApp & app)
     ImGui::TextUnformatted("Two-Pulse video-call gateway");
     ImGui::TextWrapped(
         "Each leg places its own Pexip Infinity call.  A background pump "
-        "shovels raw RGBA video and S16LE PCM audio from one leg's "
+        "shovels raw I420 video and F32LE PCM audio from one leg's "
         "data-session OUTPUT into the other leg's data-session INPUT, so "
         "anything that crosses the gap is verifiable raw media with no "
         "container or metadata.");
