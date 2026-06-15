@@ -122,27 +122,43 @@ macro(pulse_relocate_macos_dylibs)
         configure_file("${_pulse_src}" "${_pulse_dst}" COPYONLY)
         configure_file("${_lgpl_src}"  "${_lgpl_dst}"  COPYONLY)
 
+        # Helper: run a relocation command and abort with a clear diagnostic if
+        # it fails, rather than letting demos mysteriously fail to launch later.
+        macro(_pulse_run_or_die)
+            execute_process(COMMAND ${ARGN} RESULT_VARIABLE _rc)
+            if(NOT _rc EQUAL 0)
+                message(FATAL_ERROR
+                    "macOS Pulse dylib relocation step failed (exit ${_rc}): ${ARGN}")
+            endif()
+        endmacro()
+
         # Discover libpexpulse's current (absolute) reference to libpexlgpl so we
         # can rewrite exactly that load command.
         execute_process(
             COMMAND "${OTOOL}" -L "${_pulse_dst}"
-            OUTPUT_VARIABLE _pulse_deps)
+            OUTPUT_VARIABLE _pulse_deps
+            RESULT_VARIABLE _otool_rc)
+        if(NOT _otool_rc EQUAL 0)
+            message(FATAL_ERROR "otool -L on ${_pulse_dst} failed (exit ${_otool_rc})")
+        endif()
         string(REGEX MATCH "[^ \t\r\n]*libpexlgpl\\.dylib" _lgpl_ref "${_pulse_deps}")
+        if(NOT _lgpl_ref)
+            message(WARNING "Could not find libpexlgpl reference in ${_pulse_dst}; "
+                            "leaving libpexpulse's inter-library reference unchanged.")
+        endif()
 
         # libpexlgpl: id -> @rpath/libpexlgpl.dylib, then re-sign.
-        execute_process(COMMAND "${INSTALL_NAME_TOOL}"
-            -id "@rpath/libpexlgpl.dylib" "${_lgpl_dst}")
-        execute_process(COMMAND "${CODESIGN}" --force --sign - "${_lgpl_dst}")
+        _pulse_run_or_die("${INSTALL_NAME_TOOL}" -id "@rpath/libpexlgpl.dylib" "${_lgpl_dst}")
+        _pulse_run_or_die("${CODESIGN}" --force --sign - "${_lgpl_dst}")
 
         # libpexpulse: id -> @rpath/libpexpulse.dylib, fix its libpexlgpl
         # reference to @rpath/libpexlgpl.dylib, then re-sign.
-        execute_process(COMMAND "${INSTALL_NAME_TOOL}"
-            -id "@rpath/libpexpulse.dylib" "${_pulse_dst}")
+        _pulse_run_or_die("${INSTALL_NAME_TOOL}" -id "@rpath/libpexpulse.dylib" "${_pulse_dst}")
         if(_lgpl_ref)
-            execute_process(COMMAND "${INSTALL_NAME_TOOL}"
+            _pulse_run_or_die("${INSTALL_NAME_TOOL}"
                 -change "${_lgpl_ref}" "@rpath/libpexlgpl.dylib" "${_pulse_dst}")
         endif()
-        execute_process(COMMAND "${CODESIGN}" --force --sign - "${_pulse_dst}")
+        _pulse_run_or_die("${CODESIGN}" --force --sign - "${_pulse_dst}")
 
         set(PEXPULSE_LIBRARY "${_pulse_dst}")
         set(PEXPULSE_LIBDIR  "${_reloc_dir}")
