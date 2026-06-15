@@ -186,23 +186,9 @@ target_compile_options(pexninja PRIVATE
     -Wno-sign-compare
     -Wno-missing-field-initializers)
 
-# RPATH so libpexpulse resolves without LD_LIBRARY_PATH for the direct
-# dependency. Unlike the main doppler target's hardcoded <prefix>/lib, we use
-# the directory the library was actually found in (PEXPULSE_LIBDIR) so this
-# works cross-platform — including macOS, where the dylibs ship under sdk/macos/.
-set_target_properties(pexninja PROPERTIES
-    BUILD_RPATH   "${PEXPULSE_LIBDIR}"
-    INSTALL_RPATH "${PEXPULSE_LIBDIR}")
-
-# Convenience launcher (mirrors run-doppler.sh) so the transitive Pulse
-# siblings are found at runtime.
-file(GENERATE
-    OUTPUT  "${CMAKE_BINARY_DIR}/run-pexninja.sh"
-    CONTENT "#!/bin/sh
-export LD_LIBRARY_PATH=\"${PEXPULSE_LIBDIR}:\${LD_LIBRARY_PATH}\"
-export DYLD_LIBRARY_PATH=\"${PEXPULSE_LIBDIR}:\${DYLD_LIBRARY_PATH}\"
-exec \"$<TARGET_FILE:pexninja>\" \"$@\"
-"
-    FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
-                     GROUP_READ GROUP_EXECUTE
-                     WORLD_READ WORLD_EXECUTE)
+# Bake the Pulse lib directory into the RPATH (so libpexpulse resolves without
+# LD_LIBRARY_PATH) and emit build/run-pexninja.sh — using the same shared
+# helpers as every other demo so pexninja also gets PEX_BASE_PATH exported and
+# benefits from the macOS dylib relocation done in pulse_find_runtime().
+pulse_demo_rpath(pexninja)
+pulse_demo_launcher(pexninja run-pexninja.sh)

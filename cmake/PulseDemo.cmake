@@ -63,11 +63,90 @@ macro(pulse_find_runtime)
     # set it for the user.
     get_filename_component(PEXPULSE_PREFIX "${PEXPULSE_LIBDIR}" DIRECTORY)
 
+    # On macOS the shipped dylibs carry absolute install names from Pexip's build
+    # machine; rewrite them to be relocatable so the demos can actually launch.
+    # This may repoint PEXPULSE_LIBRARY / PEXPULSE_LIBDIR at the patched copies
+    # (PEXPULSE_PREFIX is intentionally left at the original install above so
+    # PEX_BASE_PATH keeps resolving the runtime's models/plugins).
+    if(APPLE)
+        pulse_relocate_macos_dylibs()
+    endif()
+
     if(NOT TARGET pexip::pulse)
         add_library(pexip::pulse SHARED IMPORTED)
         set_target_properties(pexip::pulse PROPERTIES
             IMPORTED_LOCATION "${PEXPULSE_LIBRARY}"
             INTERFACE_INCLUDE_DIRECTORIES "${PEXPULSE_INCLUDE_DIR}")
+    endif()
+endmacro()
+
+# pulse_relocate_macos_dylibs()
+#
+# Make the macOS Pulse dylibs relocatable.
+#
+# The dylibs shipped under sdk/macos/ were linked and signed on Pexip's build
+# machine, so their Mach-O install names (LC_ID_DYLIB) — and libpexpulse's
+# reference to libpexlgpl — are *absolute* paths under
+# /Users/Shared/actions-runner/... that exist on no other machine. Because those
+# load paths are absolute rather than @rpath-relative, neither the RPATH every
+# demo bakes in nor the launcher's DYLD_LIBRARY_PATH can redirect them: dyld
+# looks only at the hard-coded path, fails to find Pulse, and the exec() of the
+# (perfectly good) demo binary fails with ENOENT — which the shell surfaces as
+# the baffling "cannot execute: No such file or directory".
+#
+# Fix it by copying the dylibs into the build tree, rewriting their install
+# names to @rpath/<leaf> (and the inter-library reference to match), re-signing
+# them ad-hoc (editing a Mach-O invalidates its signature, which Apple Silicon
+# then refuses to load), and pointing the rest of the build at those copies.
+# Every demo already bakes PEXPULSE_LIBDIR into its RPATH, so @rpath resolves.
+#
+# Implemented as a macro so the PEXPULSE_LIBRARY / PEXPULSE_LIBDIR it updates
+# land back in pulse_find_runtime's (root) scope. No-op (leaves everything
+# untouched) if the expected dylibs or the Xcode command-line tools are missing.
+macro(pulse_relocate_macos_dylibs)
+    set(_pulse_src "${PEXPULSE_LIBRARY}")
+    set(_lgpl_src  "${PEXPULSE_LIBDIR}/libpexlgpl.dylib")
+
+    find_program(INSTALL_NAME_TOOL install_name_tool)
+    find_program(CODESIGN codesign)
+    find_program(OTOOL otool)
+
+    if(EXISTS "${_pulse_src}" AND EXISTS "${_lgpl_src}"
+       AND INSTALL_NAME_TOOL AND CODESIGN AND OTOOL)
+        set(_reloc_dir "${CMAKE_BINARY_DIR}/pulse-macos-runtime")
+        set(_pulse_dst "${_reloc_dir}/libpexpulse.dylib")
+        set(_lgpl_dst  "${_reloc_dir}/libpexlgpl.dylib")
+
+        # Start from pristine copies — configure_file re-copies whenever the
+        # source dylib changes, so re-running CMake always re-patches cleanly.
+        configure_file("${_pulse_src}" "${_pulse_dst}" COPYONLY)
+        configure_file("${_lgpl_src}"  "${_lgpl_dst}"  COPYONLY)
+
+        # Discover libpexpulse's current (absolute) reference to libpexlgpl so we
+        # can rewrite exactly that load command.
+        execute_process(
+            COMMAND "${OTOOL}" -L "${_pulse_dst}"
+            OUTPUT_VARIABLE _pulse_deps)
+        string(REGEX MATCH "[^ \t\r\n]*libpexlgpl\\.dylib" _lgpl_ref "${_pulse_deps}")
+
+        # libpexlgpl: id -> @rpath/libpexlgpl.dylib, then re-sign.
+        execute_process(COMMAND "${INSTALL_NAME_TOOL}"
+            -id "@rpath/libpexlgpl.dylib" "${_lgpl_dst}")
+        execute_process(COMMAND "${CODESIGN}" --force --sign - "${_lgpl_dst}")
+
+        # libpexpulse: id -> @rpath/libpexpulse.dylib, fix its libpexlgpl
+        # reference to @rpath/libpexlgpl.dylib, then re-sign.
+        execute_process(COMMAND "${INSTALL_NAME_TOOL}"
+            -id "@rpath/libpexpulse.dylib" "${_pulse_dst}")
+        if(_lgpl_ref)
+            execute_process(COMMAND "${INSTALL_NAME_TOOL}"
+                -change "${_lgpl_ref}" "@rpath/libpexlgpl.dylib" "${_pulse_dst}")
+        endif()
+        execute_process(COMMAND "${CODESIGN}" --force --sign - "${_pulse_dst}")
+
+        set(PEXPULSE_LIBRARY "${_pulse_dst}")
+        set(PEXPULSE_LIBDIR  "${_reloc_dir}")
+        message(STATUS "Relocated macOS Pulse dylibs into ${_reloc_dir}")
     endif()
 endmacro()
 
